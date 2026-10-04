@@ -422,7 +422,12 @@ export class Geometry implements GeometryBackend {
   // running two stacks used to need an uncommitted local edit. Set
   // VITE_SINDRI_WS (see `npm run dev:alt`).
   constructor(url = import.meta.env.VITE_SINDRI_WS || "ws://127.0.0.1:8765") {
-    this.url = url;
+    // A path ("/__sindri/ws") means "the server this page came from" — the web
+    // gateway build. Resolved here rather than left to `new WebSocket`, because
+    // only recent browsers accept relative WebSocket URLs.
+    this.url = url.startsWith("/")
+      ? `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}${url.replace(/\/+$/, "")}`
+      : url;
     // Does NOT connect — call init() once so the per-launch auth token is
     // fetched from the Rust shell before the first socket open.
   }
