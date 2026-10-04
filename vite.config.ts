@@ -1,3 +1,4 @@
+import { sindriWeb } from "./vite.sindri-web";
 import { defineConfig } from "vite";
 
 // `process` is Node's. This config runs in Node, not the browser, and tsconfig
@@ -28,6 +29,7 @@ const PORT = Number(process.env.SINDRI_VITE_PORT ?? 5173);
 
 export default defineConfig({
   clearScreen: false,
+  plugins: [sindriWeb()],
   // Vite's default, stated out loud because something load-bearing now lives
   // there: public/fonts/NotoSansJP-subset.woff2, which src/styles.css asks for
   // by absolute URL (`/fonts/…`). Files here are copied to dist/ VERBATIM —
