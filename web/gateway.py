@@ -125,6 +125,9 @@ class Gateway:
                 log.error(p)
             sys.exit(2)
         self.data.mkdir(parents=True, exist_ok=True)
+        if self.args.host not in ("127.0.0.1", "localhost", "::1") and not self.args.cert:
+            log.warning("listening on %s WITHOUT TLS: put Apache/nginx in front, or use --cert/--key",
+                        self.args.host)
         if not self.args.sandbox:
             log.warning("sidecars run WITHOUT a sandbox: a sidecar can write anywhere this user can. "
                         "Fine for testing at home; use --sandbox for students.")
@@ -297,7 +300,11 @@ class Gateway:
         request["sid"] = sid
         resp = await handler(request)
         if fresh and not isinstance(resp, web.WebSocketResponse):
-            resp.set_cookie(COOKIE, sid, httponly=True, samesite="Strict", secure=self.secure,
+            # Behind Apache/nginx the browser talks HTTPS to the proxy, not to us;
+            # the proxy says so in X-Forwarded-Proto. Trusting that header is safe
+            # only because a proxied gateway listens on 127.0.0.1.
+            secure = self.secure or request.headers.get("X-Forwarded-Proto", "").lower() == "https"
+            resp.set_cookie(COOKIE, sid, httponly=True, samesite="Strict", secure=secure,
                             max_age=self.args.keep_hours * 3600, path="/")
         return resp
 
