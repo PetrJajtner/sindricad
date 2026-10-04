@@ -100,7 +100,7 @@ class Gateway:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.sidecar_dir = Path(args.sidecar).resolve()
-        self.python = Path(args.python).resolve() if args.python else self.sidecar_dir / ".venv" / "bin" / "python"
+        self.python = Path(args.python).absolute() if args.python else self.sidecar_dir / ".venv" / "bin" / "python"
         self.dist = Path(args.dist).resolve()
         self.data = Path(args.data).resolve()
         self.sessions: dict[str, Session] = {}
