@@ -1,0 +1,9 @@
+[project]
+name = "sindricad-web-gateway"
+version = "0.1.0"
+description = "Serves SindriCAD to browsers on a LAN, one geometry sidecar per session"
+requires-python = ">=3.11"
+dependencies = ["aiohttp>=3.9"]
+
+[tool.uv]
+package = false
