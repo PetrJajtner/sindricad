@@ -18,6 +18,39 @@ const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const baseName = (path: string) => path.split(/[\\/]/).pop() ?? path;
 const formatCount = fmtCount; // grouped, active locale — see ui/units
 
+// ---- Browser (non-Tauri) export --------------------------------------------
+// The sidecar only writes to a server-side path, and a plain browser has none.
+// So in a browser the export goes into a folder ON THE SERVER, and the finished
+// file is fetched back over HTTP. Whatever serves the page provides both
+// endpoints: the vite dev plugin (vite.sindri-web.ts) now, a gateway later —
+// which is also where per-user folders belong.
+//   GET /__sindri/export-dir         -> { "dir": "/abs/server/folder" }
+//   GET /__sindri/download?name=X    -> the file X from that folder (attachment)
+const safeFileName = (s: string) => s.replace(/[\\/:*?"<>|\x00-\x1f]/g, "_").trim();
+
+async function browserExportDir(): Promise<string> {
+  const r = await fetch("/__sindri/export-dir", { cache: "no-store" });
+  if (!r.ok) throw new Error(`export-dir: HTTP ${r.status}`);
+  const { dir } = (await r.json()) as { dir?: string };
+  if (!dir) throw new Error("export-dir: no folder configured on the server");
+  return dir.replace(/\/+$/, "");
+}
+
+/** Hand a server-side export to the browser as a normal download. */
+function browserDownload(serverPath: string) {
+  const a = document.createElement("a");
+  a.href = `/__sindri/download?name=${encodeURIComponent(baseName(serverPath))}`;
+  a.download = baseName(serverPath);
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+/** Base name for an export, from the document's file name. */
+function exportBaseName(store: DocumentStore): string {
+  return safeFileName(store.fileName.replace(/\.sindri$/i, "")) || "part";
+}
+
 /** Every geometry hash the document references, and the mesh keys worth
  *  carrying. Rust turns these into container entries; the frontend collects them
  *  because it is the one that owns the document. */
@@ -278,10 +311,6 @@ export async function openDocumentAtPath(
 }
 
 export async function exportModel(store: DocumentStore, geometry: GeometryBackend) {
-  if (!isTauri()) {
-    console.warn("export needs the native app (a real filesystem path)");
-    return;
-  }
   // With several bodies, ask what to export: all merged, each as its own file, or
   // one specific body. A single-body doc skips straight to the save dialog.
   const bodies = store.buildState.result?.bodies ?? [];
@@ -304,6 +333,29 @@ export async function exportModel(store: DocumentStore, geometry: GeometryBacken
       if (!picked) return;
       opts.body = picked;
     }
+  }
+
+  if (!isTauri()) {
+    // No native save dialog: ask for the format in-app, write into the server's
+    // export folder, then download (runExport does the download).
+    const { choose } = await import("../ui/choice");
+    const fmt = await choose<ExportFormat>("Export format", [
+      { value: "stl", label: "STL", hint: "mesh for any slicer" },
+      { value: "3mf", label: "3MF", hint: "mesh with units and colors" },
+      { value: "step", label: "STEP", hint: "exact geometry for other CAD" },
+      { value: "glb", label: "GLB (glTF)", hint: "for viewers and the web" },
+    ]);
+    if (!fmt) return;
+    let dir: string;
+    try {
+      dir = await browserExportDir();
+    } catch (e) {
+      await reportError(t("file.error.export", { reason: errMsg(e) }));
+      return;
+    }
+    const base = exportBaseName(store) + (opts.separate ? "-parts" : "");
+    await runExport(store, geometry, `${dir}/${base}.${fmt}`, fmt, opts);
+    return;
   }
 
   const { save } = await import("@tauri-apps/plugin-dialog");
@@ -330,13 +382,20 @@ export async function exportBody(
   bodyId: string,
   fmt: "stl" | "3mf",
 ) {
-  if (!isTauri()) {
-    console.warn("export needs the native app (a real filesystem path)");
-    return;
-  }
   const body = store.buildState.result?.bodies?.find((b) => b.id === bodyId);
   if (!body) return;
   const name = (store.bodyName(bodyId) ?? body.name).replace(/[\\/:*?"<>|]/g, "_").trim() || "part";
+  if (!isTauri()) {
+    let dir: string;
+    try {
+      dir = await browserExportDir();
+    } catch (e) {
+      await reportError(t("file.error.export", { reason: errMsg(e) }));
+      return;
+    }
+    await runExport(store, geometry, `${dir}/${safeFileName(name) || "part"}.${fmt}`, fmt, { body: bodyId });
+    return;
+  }
   const { save } = await import("@tauri-apps/plugin-dialog");
   let path = await save({
     filters: [{ name: fmt.toUpperCase(), extensions: [fmt] }],
@@ -389,8 +448,15 @@ async function runExport(
   // listed as notes, and only a missing feature puts "with warnings" in the
   // title: see exportReport.
   const written = res.paths?.length ? res.paths : res.path ? [res.path] : [];
+  if (!isTauri()) {
+    // Browser: the files sit in the server's export folder; hand each one over
+    // as a download (a separate-bodies export may trigger the browser's
+    // "allow multiple downloads" prompt), and list names, not server paths.
+    for (const p of written) browserDownload(p);
+  }
+  const shown = isTauri() ? written : written.map(baseName);
   const report = exportReport(res.warnings, "export", store.document.features, store.namedBodies(store.buildState.result?.bodies));
-  const lines = [...written, ...report.lines];
+  const lines = [...shown, ...report.lines];
   if (lines.length) {
     const { listModal } = await import("../ui/choice");
     const title = report.failed
@@ -431,10 +497,10 @@ export async function exportPrintProject(
   geometry: GeometryBackend,
   opts: { path?: string; settings?: Record<string, unknown> } = {},
 ): Promise<string | null> {
-  if (!isTauri()) {
-    console.warn("print export needs the native app (a real filesystem path)");
-    return null;
-  }
+  // Browser: no staging path (that is the Tauri "open in Orca" flow), so write
+  // into the server's export folder and download the project afterwards.
+  const browser = !isTauri();
+  if (browser && opts.path) return null;
   if (!geometry.exportProject) {
     await reportError(t("file.export.needsSidecar"));
     return null;
@@ -446,6 +512,14 @@ export async function exportPrintProject(
   }
 
   let path = opts.path;
+  if (!path && browser) {
+    try {
+      path = `${await browserExportDir()}/${exportBaseName(store)}.3mf`;
+    } catch (e) {
+      await reportError(t("file.error.printExport", { reason: errMsg(e) }));
+      return null;
+    }
+  }
   if (!path) {
     const { save } = await import("@tauri-apps/plugin-dialog");
     const base = store.fileName.replace(/\.sindri$/i, "") || "part";
@@ -477,6 +551,17 @@ export async function exportPrintProject(
     return null;
   }
   void warnPrintAssignments(store, bodies.map((b) => b.id));
+  if (browser) {
+    const written = res.path ?? path;
+    browserDownload(written);
+    if (res.warnings?.length) {
+      const report = exportReport(res.warnings, "export", store.document.features, store.namedBodies(store.buildState.result?.bodies));
+      const { listModal } = await import("../ui/choice");
+      const title = report.failed ? t("file.export.projectDoneWarnings") : t("file.export.projectDone");
+      await listModal(title, [baseName(written), ...report.lines]);
+    }
+    return written;
+  }
   // Only surface a modal when the sidecar had something to say (a feature that
   // didn't build, or a note such as open edges): the silent-staging path
   // (Stage D) shouldn't pop a dialog on the happy path. Only a missing feature
@@ -903,6 +988,8 @@ async function reportError(msg: string) {
     await message(msg, { title: "SindriCAD", kind: "error" });
   } else {
     console.error(msg);
+    // A console line is invisible to a student in a browser; say it on screen.
+    window.alert(msg);
   }
 }
 
