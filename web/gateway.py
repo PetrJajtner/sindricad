@@ -25,7 +25,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
 import hmac
+import json
 import logging
 import mimetypes
 import os
@@ -37,6 +39,7 @@ import socket
 import ssl
 import sys
 import time
+import zipfile
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
@@ -55,6 +58,127 @@ SID_RE = re.compile(r"^[A-Za-z0-9_-]{32}$")
 # The sidecar caps a frame at 128 MiB; give the proxy a little headroom.
 MAX_MSG = 160 * 1024 * 1024
 WS_PATHS = ("/__sindri/ws", "/__sindri/ws/")
+
+
+# ---- .sindri container -------------------------------------------------------
+# The same ZIP the desktop app writes and reads (src-tauri/src/container.rs), so a
+# file saved in the browser opens at home in the desktop app and vice versa:
+#   manifest.json      STORED, first
+#   document.json      DEFLATE
+#   geom/<hash>.bbrep  DEFLATE, the blob named by its BLAKE2b-128 hash
+#   mesh/<key>.bin     optional reopen cache: never written here, skipped on read
+CONTAINER_VERSION = 1
+HASH_ALG = "blake2b-128"
+HASH_RE = re.compile(r"^[0-9a-f]{32}$")
+MAX_UNCOMPRESSED = 4 << 30  # refuse archives that would expand past this
+
+
+class ContainerError(Exception):
+    """A user-facing reason a document could not be saved or opened."""
+
+
+def _new_hash():
+    return hashlib.blake2b(digest_size=16)
+
+
+def write_container(dest: Path, document_json: str, blob_dir: Path, hashes: list[str]) -> None:
+    rows, missing = [], []
+    for h in sorted(set(hashes)):
+        p = blob_dir / f"{h}.bbrep"
+        if p.is_file():
+            rows.append({"entry": f"geom/{h}.bbrep", "hash": h, "bytes": p.stat().st_size})
+        else:
+            missing.append(h)
+    if missing:
+        # Same rule as the desktop: never write a file whose geometry is not in it.
+        raise ContainerError(
+            f"{len(missing)} of this document's imported bodies could not be found on the "
+            "server (the session folder may have been cleaned up), so saving was stopped "
+            "rather than writing a file with missing geometry.")
+    manifest = {"container": CONTAINER_VERSION, "hashAlg": HASH_ALG, "app": "sindricad-web",
+                "blobs": rows, "meshes": []}
+    tmp = dest.with_name(f"{dest.name}.tmp-{secrets.token_hex(6)}")
+    try:
+        with zipfile.ZipFile(tmp, "w") as z:
+            z.writestr("manifest.json", json.dumps(manifest, indent=2), compress_type=zipfile.ZIP_STORED)
+            z.writestr("document.json", document_json, compress_type=zipfile.ZIP_DEFLATED)
+            for r in rows:
+                z.write(blob_dir / f"{r['hash']}.bbrep", r["entry"], compress_type=zipfile.ZIP_DEFLATED)
+        os.replace(tmp, dest)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def read_container(src: Path, blob_dir: Path) -> str:
+    """Extract a container's geometry into blob_dir (verifying every hash) and
+    return its document JSON. Blob files are named by the VERIFIED hash, never by
+    a name from inside the archive, so zip-slip cannot happen."""
+    damaged = "This document is damaged and cannot be opened."
+    try:
+        z = zipfile.ZipFile(src)
+    except (zipfile.BadZipFile, OSError):
+        raise ContainerError(damaged) from None
+    with z:
+        if sum(i.file_size for i in z.infolist()) > MAX_UNCOMPRESSED:
+            raise ContainerError(f"This document expands to more than {MAX_UNCOMPRESSED >> 30} GiB and was refused.")
+        try:
+            manifest = json.loads(z.read("manifest.json"))
+        except KeyError:
+            raise ContainerError("This document is missing its manifest and cannot be opened.") from None
+        except ValueError:
+            raise ContainerError("This document has an unreadable manifest and cannot be opened.") from None
+        if not isinstance(manifest, dict):
+            raise ContainerError("This document has an unreadable manifest and cannot be opened.")
+        version = manifest.get("container")
+        if not isinstance(version, int) or version > CONTAINER_VERSION:
+            raise ContainerError(f"This document uses a newer SindriCAD container format (v{version}). "
+                                 "The server's SindriCAD needs an update to open it.")
+        if manifest.get("hashAlg") != HASH_ALG:
+            raise ContainerError(f"This document uses an unsupported hash ({manifest.get('hashAlg')}).")
+        try:
+            document_json = z.read("document.json").decode("utf-8")
+        except KeyError:
+            raise ContainerError("This document is missing its contents and cannot be opened.") from None
+        except (UnicodeDecodeError, zipfile.BadZipFile, OSError):
+            raise ContainerError(damaged) from None
+
+        blob_dir.mkdir(parents=True, exist_ok=True)
+        for row in manifest.get("blobs") or []:
+            h = row.get("hash", "") if isinstance(row, dict) else ""
+            entry = row.get("entry", "") if isinstance(row, dict) else ""
+            if not HASH_RE.match(h) or not isinstance(entry, str):
+                raise ContainerError(damaged)
+            final = blob_dir / f"{h}.bbrep"
+            if final.exists():
+                continue  # same hash => same bytes
+            tmp = blob_dir / f"{h}.bbrep.tmp-{secrets.token_hex(6)}"
+            digest = _new_hash()
+            try:
+                with z.open(entry) as fsrc, open(tmp, "wb") as fout:
+                    while chunk := fsrc.read(1 << 20):
+                        digest.update(chunk)
+                        fout.write(chunk)
+                if digest.hexdigest() != h:
+                    raise ContainerError(
+                        "This document's geometry does not match its manifest - the file is damaged "
+                        "or was modified. Opening it was refused rather than showing you the wrong shape.")
+                os.replace(tmp, final)
+            except KeyError:
+                tmp.unlink(missing_ok=True)
+                raise ContainerError(f"This document is missing part of its geometry ({entry}).") from None
+            except (zipfile.BadZipFile, OSError):
+                tmp.unlink(missing_ok=True)
+                raise ContainerError(damaged) from None
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                raise
+    return document_json
+
+
+def safe_name(raw: str, fallback: str) -> str:
+    name = re.sub(r"[^\w.\- ()]", "_", os.path.basename(raw or "")).strip(" .")
+    return (name or fallback)[-120:]
 
 
 class Full(Exception):
@@ -86,7 +210,7 @@ class Session:
         self.last_seen = time.time()
 
     def ensure_dirs(self) -> None:
-        for sub in ("exports", "cache", "tmp"):
+        for sub in ("exports", "cache", "tmp", "blobs", "uploads"):
             (self.dir / sub).mkdir(parents=True, exist_ok=True)
 
 
@@ -176,6 +300,15 @@ class Gateway:
             "SINDRI_CACHE_MAX_GB": str(self.args.cache_gb),
             "TMPDIR": str(s.dir / "tmp"),
             "PYTHONUNBUFFERED": "1",
+            # The rest mirrors what the desktop shell sets (src-tauri/src/sidecar.rs).
+            # Imported geometry goes to the session, where Save can pack it.
+            "SINDRI_BLOB_DIR": str(s.dir / "blobs"),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONUTF8": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
         })
         return env
 
@@ -347,6 +480,93 @@ class Gateway:
             "Cache-Control": "no-store",
         })
 
+    def _cross_origin(self, request: web.Request) -> bool:
+        origin = request.headers.get("Origin", "")
+        return bool(origin) and urlsplit(origin).netloc != request.host
+
+    async def _receive(self, request: web.Request, dest: Path) -> int:
+        """Stream a request body to dest (atomically), enforcing --max-upload-mb."""
+        limit = int(self.args.max_upload_mb * 1024 * 1024)
+        if request.content_length and request.content_length > limit:
+            raise web.HTTPRequestEntityTooLarge(max_size=limit, actual_size=request.content_length)
+        tmp = dest.with_name(f".{dest.name}.part-{secrets.token_hex(4)}")
+        size = 0
+        try:
+            with open(tmp, "wb") as f:
+                async for chunk in request.content.iter_chunked(1 << 16):
+                    size += len(chunk)
+                    if size > limit:
+                        raise web.HTTPRequestEntityTooLarge(max_size=limit, actual_size=size)
+                    f.write(chunk)
+            os.replace(tmp, dest)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+        return size
+
+    async def upload(self, request: web.Request) -> web.Response:
+        """A model file for Import: lands in the session's uploads/, where the
+        sidecar reads it by path like the desktop app reads a local file."""
+        if self._cross_origin(request):
+            raise web.HTTPForbidden(text="bad origin")
+        s = self.session(request["sid"])
+        s.ensure_dirs()
+        s.touch()
+        name = safe_name(request.query.get("name", ""), "upload")
+        dest = s.dir / "uploads" / name
+        size = await self._receive(request, dest)
+        log.info("[%s] uploaded %s (%d bytes)", s.tag, name, size)
+        return web.json_response({"path": str(dest), "name": name})
+
+    async def save(self, request: web.Request) -> web.StreamResponse:
+        """Pack the document and its imported geometry into a .sindri container."""
+        if self._cross_origin(request):
+            raise web.HTTPForbidden(text="bad origin")
+        s = self.session(request["sid"])
+        s.ensure_dirs()
+        s.touch()
+        try:
+            body = await request.json()
+        except ValueError:
+            raise web.HTTPBadRequest(text="bad request")
+        doc, hashes = body.get("document"), body.get("hashes") or []
+        if (not isinstance(doc, str) or not isinstance(hashes, list)
+                or not all(isinstance(h, str) and HASH_RE.match(h) for h in hashes)):
+            raise web.HTTPBadRequest(text="bad request")
+        name = safe_name(str(body.get("name") or ""), "model")
+        if not name.lower().endswith(".sindri"):
+            name += ".sindri"
+        out = s.dir / "tmp" / f"save-{secrets.token_hex(6)}.sindri"
+        try:
+            await asyncio.to_thread(write_container, out, doc, s.dir / "blobs", hashes)
+        except ContainerError as e:
+            return web.json_response({"error": str(e)}, status=409)
+        asyncio.get_running_loop().call_later(300, lambda: out.unlink(missing_ok=True))
+        ascii_name = re.sub(r'[^\x20-\x7e]|["\\]', "_", name)
+        return web.FileResponse(out, headers={
+            "Content-Type": "application/octet-stream",
+            "Content-Disposition": f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(name)}",
+            "Cache-Control": "no-store",
+        })
+
+    async def open_document(self, request: web.Request) -> web.Response:
+        """Unpack an uploaded .sindri container: geometry into the session's
+        blob store, document JSON back to the page."""
+        if self._cross_origin(request):
+            raise web.HTTPForbidden(text="bad origin")
+        s = self.session(request["sid"])
+        s.ensure_dirs()
+        s.touch()
+        tmp = s.dir / "tmp" / f"open-{secrets.token_hex(6)}.sindri"
+        try:
+            await self._receive(request, tmp)
+            doc = await asyncio.to_thread(read_container, tmp, s.dir / "blobs")
+        except ContainerError as e:
+            return web.json_response({"error": str(e)}, status=422)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return web.Response(text=doc, content_type="application/json", headers={"Cache-Control": "no-store"})
+
     async def ws(self, request: web.Request) -> web.StreamResponse:
         # Same-origin only: the session rides on a cookie, so a page from
         # another site must not be able to open this socket in the student's name.
@@ -432,6 +652,9 @@ class Gateway:
         app.router.add_get("/index.html", self.index)
         app.router.add_get("/__sindri/export-dir", self.export_dir)
         app.router.add_get("/__sindri/download", self.download)
+        app.router.add_post("/__sindri/upload", self.upload)
+        app.router.add_post("/__sindri/save", self.save)
+        app.router.add_post("/__sindri/open", self.open_document)
         for p in WS_PATHS:
             app.router.add_get(p, self.ws)
         app.router.add_static("/", self.dist, show_index=False, follow_symlinks=False)
@@ -466,6 +689,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--keep-hours", type=float, default=24, help="delete session folders unused this long")
     p.add_argument("--cache-gb", type=float, default=0.5, help="disk cache cap per session")
     p.add_argument("--start-timeout", type=float, default=90, help="seconds to wait for a sidecar to start")
+    p.add_argument("--max-upload-mb", type=float, default=200, help="largest file a browser may upload")
     p.add_argument("--sandbox", action="store_true", help="run sidecars in bubblewrap (recommended for students)")
     return p.parse_args()
 
