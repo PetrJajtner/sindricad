@@ -51,6 +51,70 @@ function exportBaseName(store: DocumentStore): string {
   return safeFileName(store.fileName.replace(/\.sindri$/i, "")) || "part";
 }
 
+// ---- Browser (non-Tauri) import / save / open -------------------------------
+// The gateway (web/gateway.py) provides:
+//   POST /__sindri/upload?name=X  body = file  -> { path }  (into the session folder)
+//   POST /__sindri/save   { name, document, hashes } -> a .sindri container (ZIP)
+//   POST /__sindri/open   body = .sindri ZIP -> document JSON (geometry unpacked)
+// The containers are the desktop app's format, so files move freely between the two.
+const MESH_EXTS = ["stl", "3mf", "step", "stp", "obj", "glb"];
+
+/** Let the user pick a local file. Resolves null if they cancel. */
+function pickFile(accept: string): Promise<File | null> {
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = accept;
+    input.onchange = () => resolve(input.files?.[0] ?? null);
+    input.addEventListener("cancel", () => resolve(null));
+    input.click();
+  });
+}
+
+/** The server's reason for a failed request, as a sentence. */
+async function serverError(r: Response): Promise<string> {
+  if (r.status === 413) return "the file is too large for this server";
+  try {
+    const j = (await r.json()) as { error?: string };
+    if (j.error) return j.error;
+  } catch {
+    /* not JSON */
+  }
+  return `HTTP ${r.status}`;
+}
+
+async function uploadToServer(file: File): Promise<string> {
+  const r = await fetch(`/__sindri/upload?name=${encodeURIComponent(file.name)}`, { method: "POST", body: file });
+  if (!r.ok) throw new Error(await serverError(r));
+  const { path } = (await r.json()) as { path?: string };
+  if (!path) throw new Error("the server did not accept the file");
+  return path;
+}
+
+/** Upload a model file and import it as a body. */
+async function importUploaded(store: DocumentStore, geometry: GeometryBackend, file: File) {
+  let path: string;
+  try {
+    path = await uploadToServer(file);
+  } catch (e) {
+    await reportError(t("file.error.import", { name: file.name, reason: errMsg(e) }));
+    return;
+  }
+  // The feature records the ORIGINAL file name, not the server path: a saved
+  // file must not carry the session folder (its name is the session's key).
+  await importPath(store, geometry, path, file.name);
+}
+
+function downloadBlob(name: string, blob: Blob) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
+}
+
 /** Every geometry hash the document references, and the mesh keys worth
  *  carrying. Rust turns these into container entries; the frontend collects them
  *  because it is the one that owns the document. */
@@ -119,10 +183,26 @@ export async function saveDocumentAs(store: DocumentStore) {
       void clearRecovery(path);
     }
   } else {
-    // Plain dev browser: no Tauri, so no container. Geometry lives in the
-    // sidecar's blob store either way, so this download is the document only —
-    // useful for inspecting a feature tree, NOT a portable file.
-    downloadText(`${store.fileName}.sindri`, store.toJSON());
+    // Browser: the gateway packs the document and its imported geometry into
+    // the same container the desktop app writes.
+    const name = `${store.fileName}.sindri`;
+    try {
+      const r = await fetch("/__sindri/save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, document: store.toJSON(), hashes: referencedHashes(store) }),
+      });
+      if (r.status === 404) {
+        // No gateway (plain vite dev server): the document only, as before —
+        // fine for a feature tree, NOT portable if it has imported bodies.
+        downloadText(name, store.toJSON());
+        return;
+      }
+      if (!r.ok) throw new Error(await serverError(r));
+      downloadBlob(name, await r.blob());
+    } catch (e) {
+      await reportError(t("file.error.save", { path: name, reason: errMsg(e) }));
+    }
   }
 }
 
@@ -185,13 +265,28 @@ export async function openDocument(store: DocumentStore, geometry: GeometryBacke
       await importPath(store, geometry, path); // a mesh / CAD file → import as a body
     }
   } else {
-    const text = await uploadText();
-    if (text) {
-      try {
-        store.load(text);
-      } catch (e) {
-        await reportError(t("file.error.openDocument", { reason: errMsg(e) }));
+    const file = await pickFile([".sindri", ".json", ...MESH_EXTS.map((e) => `.${e}`)].join(","));
+    if (!file) return;
+    const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
+    if (MESH_EXTS.includes(ext)) {
+      await importUploaded(store, geometry, file); // a mesh / CAD file → import as a body
+      return;
+    }
+    try {
+      let text: string;
+      const head = new Uint8Array(await file.slice(0, 2).arrayBuffer());
+      if (head[0] === 0x50 && head[1] === 0x4b) {
+        // "PK": a container — the gateway unpacks its geometry for this session.
+        const r = await fetch("/__sindri/open", { method: "POST", body: file });
+        if (!r.ok) throw new Error(await serverError(r));
+        text = await r.text();
+      } else {
+        // Plain JSON (older format); inline geometry moves into the blob store.
+        text = await migrateInlineGeometry(await file.text(), geometry);
       }
+      store.load(text);
+    } catch (e) {
+      await reportError(t("file.error.openDocument", { reason: errMsg(e) }));
     }
   }
 }
@@ -690,7 +785,8 @@ export async function warnPrintAssignments(store: DocumentStore, bodyIds: string
  *  this needs the native app (a real filesystem path), like export. */
 export async function importModel(store: DocumentStore, geometry: GeometryBackend) {
   if (!isTauri()) {
-    console.warn("import needs the native app (a real filesystem path)");
+    const file = await pickFile(MESH_EXTS.map((e) => `.${e}`).join(","));
+    if (file) await importUploaded(store, geometry, file);
     return;
   }
   const { open } = await import("@tauri-apps/plugin-dialog");
@@ -893,7 +989,7 @@ const KNOWN_REFERENCE_REASONS = new Set([
 ]);
 
 
-async function importPath(store: DocumentStore, geometry: GeometryBackend, path: string) {
+async function importPath(store: DocumentStore, geometry: GeometryBackend, path: string, source?: string) {
   const fmt = extToImportFormat(path);
   // runBusy is what makes the operation VISIBLE and stoppable: an import used to
   // run with no busy state at all, so the timeline showed nothing and there was
@@ -928,7 +1024,7 @@ async function importPath(store: DocumentStore, geometry: GeometryBackend, path:
     format: fmt,
     name: res.name,
     geom: res.geom,
-    source: path,
+    source: source ?? path,
     solid: res.solid,
     ...(res.color !== undefined ? { color: res.color } : {}),
     // the file's assembly tree, when it had one. Spread the same way `color` is,
@@ -1013,19 +1109,3 @@ function downloadText(name: string, text: string) {
   URL.revokeObjectURL(a.href);
 }
 
-function uploadText(): Promise<string | null> {
-  return new Promise((resolve) => {
-    const input = document.createElement("input");
-    input.type = "file";
-    input.accept = ".sindri,.json,application/json";
-    input.onchange = () => {
-      const file = input.files?.[0];
-      if (!file) return resolve(null);
-      const reader = new FileReader();
-      reader.onload = () => resolve(String(reader.result));
-      reader.onerror = () => resolve(null);
-      reader.readAsText(file);
-    };
-    input.click();
-  });
-}
