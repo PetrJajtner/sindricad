@@ -14,8 +14,10 @@ APP="${SINDRI_APP:-/var/data/www/cad.jajtnerovi.cz}"
 VENVS="${SINDRI_VENVS:-/opt/sindricad}"
 BUILD="${BUILD:-1}"
 
-# Use the system Python (readable by the service user), never one uv keeps in $HOME.
-export UV_PYTHON_PREFERENCE=only-system
+# Sidecar: Python <3.13 downloaded by uv to $VENVS/python (never $HOME: ProtectHome=yes).
+# Gateway: system Python (security updates via apt).
+export UV_PYTHON_INSTALL_DIR="$VENVS/python"
+SIDECAR_PYTHON="${SIDECAR_PYTHON:-3.12}"
 
 cd "$REPO"
 if [ "$BUILD" = 1 ]; then
@@ -34,7 +36,7 @@ rsync -a --delete \
 rsync -a web/gateway.py web/pyproject.toml web/uv.lock "$APP/web/"
 
 echo "== sidecar environment ($VENVS/sidecar-venv)"
-(cd "$APP/sidecar" && UV_PROJECT_ENVIRONMENT="$VENVS/sidecar-venv" uv sync --no-dev)
+(cd "$APP/sidecar" && UV_PROJECT_ENVIRONMENT="$VENVS/sidecar-venv" uv sync --no-dev --managed-python --python "$SIDECAR_PYTHON")
 if ! grep -qw sse4_2 /proc/cpuinfo; then
   echo "   CPU without SSE4.2: pinning numpy<2.4"
   uv pip install --python "$VENVS/sidecar-venv/bin/python" "numpy<2.4"
@@ -43,7 +45,7 @@ fi
   "import numpy, OCP; print('   sidecar imports OK, numpy', numpy.__version__)"
 
 echo "== gateway environment ($VENVS/web-venv)"
-(cd "$APP/web" && UV_PROJECT_ENVIRONMENT="$VENVS/web-venv" uv sync)
+(cd "$APP/web" && UV_PROJECT_ENVIRONMENT="$VENVS/web-venv" uv sync --no-managed-python)
 
 if systemctl cat sindri-web >/dev/null 2>&1; then
   echo "== restarting sindri-web"
