@@ -126,7 +126,9 @@ describe("the dialogs use it", () => {
   // longer build the NOT-in-the-export sentence themselves.
   it("File > Export, the per-body export and the print project", () => {
     expect(filesSrc).not.toContain('t("file.export.featureMissing"');
-    expect(filesSrc.match(/exportReport\(res\.warnings, "export"/g)?.length).toBe(2);
+    // 3, not 2: the web version's browser branch of the print project has its own
+    // call (it downloads the file instead of showing a server path).
+    expect(filesSrc.match(/exportReport\(res\.warnings, "export"/g)?.length).toBe(3);
     expect(filesSrc).toContain('report.failed\n      ? t("file.export.doneTitleWarnings"');
     expect(filesSrc).toContain('report.failed ? t("file.export.projectDoneWarnings") : t("file.export.projectDone")');
   });
