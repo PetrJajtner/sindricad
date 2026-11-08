@@ -34,6 +34,9 @@ rsync -a --delete \
   --exclude 'test_*.py' --exclude 'tests/' --exclude '*.log' \
   sidecar/ "$APP/sidecar/"
 rsync -a web/gateway.py web/pyproject.toml web/uv.lock "$APP/web/"
+# Data the sidecar reads at import; upstream ships it next to the modules too
+# (scripts/build-sidecar-runtime.sh). After the sidecar rsync, whose --delete would drop it.
+cp thread_standards.json "$APP/sidecar/"
 
 echo "== sidecar environment ($VENVS/sidecar-venv)"
 (cd "$APP/sidecar" && UV_PROJECT_ENVIRONMENT="$VENVS/sidecar-venv" uv sync --no-dev --managed-python --python "$SIDECAR_PYTHON")
