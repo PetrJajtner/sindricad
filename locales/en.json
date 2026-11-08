@@ -1,5 +1,6 @@
 {
   "about": {
+    "source": "Source code of this version (AGPL-3.0): {url}",
     "title": "About SindriCAD",
     "translations": "Translations",
     "version": "Version {version}"
@@ -1229,6 +1230,7 @@
       "checkUpdates": "Check for Updates…",
       "customizeShortcuts": "Customize Shortcuts…",
       "guide": "Guide on GitHub",
+      "source": "Source Code of This Version",
       "support": "Support SindriCAD",
       "shortcuts": "Keyboard Shortcuts",
       "title": "Help",

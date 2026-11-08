@@ -23,6 +23,12 @@ export const TUTORIALS_URL = "https://www.youtube.com/playlist?list=PLS7xEtXRFd1
  *  turn this into a 404. */
 export const GUIDE_URL = "https://github.com/MakerViking/sindricad#readme";
 
+/** Web version only: where the source code of THIS server's (modified) build is
+ *  published, as AGPL-3.0 section 13 asks of a modified version that users reach
+ *  over a network. Set at build time by web/deploy.sh (VITE_SINDRI_SOURCE_URL);
+ *  empty in the desktop app, which then shows no such menu item. */
+export const SOURCE_URL: string = import.meta.env.VITE_SINDRI_SOURCE_URL || "";
+
 /** Open a help page in the system browser, and say so if that fails.
  *
  *  The catch is the whole point. `opener:allow-open-url` in
