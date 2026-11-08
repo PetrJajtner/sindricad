@@ -13,6 +13,8 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 APP="${SINDRI_APP:-/var/data/www/cad.jajtnerovi.cz}"
 VENVS="${SINDRI_VENVS:-/opt/sindricad}"
 BUILD="${BUILD:-1}"
+# Shown in the app (Help > About, Help > Source Code), AGPL-3.0 section 13.
+SOURCE_URL="${SINDRI_SOURCE_URL:-https://github.com/PetrJajtner/sindricad/tree/web}"
 
 # Sidecar: Python <3.13 downloaded by uv to $VENVS/python (never $HOME: ProtectHome=yes).
 # Gateway: system Python (security updates via apt).
@@ -22,7 +24,12 @@ SIDECAR_PYTHON="${SIDECAR_PYTHON:-3.12}"
 cd "$REPO"
 if [ "$BUILD" = 1 ]; then
   echo "== building frontend"
-  VITE_SINDRI_WS=/__sindri/ws npm run build
+  # SINDRI_VERSION comes from sindricad-update.sh (upstream build number); by hand
+  # it is just the commits: upstream base and this branch.
+  base="$(git merge-base HEAD origin/main 2>/dev/null || true)"
+  VERSION="${SINDRI_VERSION:-upstream ${base:0:7}}, web $(git rev-parse --short HEAD)"
+  echo "   version: $VERSION"
+  VITE_SINDRI_WS=/__sindri/ws VITE_SINDRI_VERSION="$VERSION" VITE_SINDRI_SOURCE_URL="$SOURCE_URL" npm run build
 fi
 [ -f dist/index.html ] || { echo "dist/index.html missing - build first"; exit 1; }
 

@@ -48,7 +48,8 @@ async function updatesSupported(): Promise<boolean> {
 /** the packaged app's version ("dev" in a plain-browser session). CI stamps
  *  packaged builds 0.1.<run>; local builds carry tauri.conf.json's 0.1.0. */
 export async function appVersion(): Promise<string> {
-  if (!isTauri()) return "dev";
+  // web version: what web/deploy.sh built (upstream build and commits), else "dev"
+  if (!isTauri()) return import.meta.env.VITE_SINDRI_VERSION || "dev";
   try {
     const { getVersion } = await import("@tauri-apps/api/app");
     return await getVersion();
@@ -60,7 +61,11 @@ export async function appVersion(): Promise<string> {
 /** Help → About: the one place to read off which version is running. */
 export async function showAbout(): Promise<void> {
   const { listModal } = await import("./choice");
-  await listModal(t("about.title"), [t("about.version", { version: await appVersion() })]);
+  const lines = [t("about.version", { version: await appVersion() })];
+  // web version: where this build's source is published (AGPL-3.0 section 13)
+  const source = import.meta.env.VITE_SINDRI_SOURCE_URL;
+  if (!isTauri() && source) lines.push(t("about.source", { url: source }));
+  await listModal(t("about.title"), lines);
 }
 
 /** Check the beta feed and prompt to install when an update exists. An available

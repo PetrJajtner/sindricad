@@ -24,7 +24,7 @@ import { SketchPalette } from "./ui/sketchPalette";
 import { installKeymap } from "./input/keymap";
 import { toggleShortcutHUD } from "./input/shortcuts";
 import { checkForUpdates, scheduleStartupUpdateCheck, showAbout } from "./ui/updates";
-import { TUTORIALS_URL, GUIDE_URL, openHelp } from "./ui/help";
+import { TUTORIALS_URL, GUIDE_URL, SOURCE_URL, openHelp } from "./ui/help";
 import { initSpaceMouse, setSpaceMouseConfig, getSpaceMouseMode, setSpaceMouseMode, setSpaceMouseDevice } from "./input/spacemouse";
 import { SpaceMouseSettings } from "./ui/spaceMouseSettings";
 import { openShortcutSettings } from "./ui/shortcutSettings";
@@ -627,6 +627,8 @@ const menubar = new Menubar(document.getElementById("menubar")!, [
       // nothing in the app linked to either, so Help offered no help at all.
       { label: t("menu.help.tutorials", { count: 8 }), onClick: () => void openHelp(TUTORIALS_URL) },
       { label: t("menu.help.guide"), onClick: () => void openHelp(GUIDE_URL) },
+      // web version: the source of this server's build (AGPL-3.0 section 13)
+      ...(SOURCE_URL ? [{ label: t("menu.help.source"), onClick: () => void openHelp(SOURCE_URL) }] : []),
       { label: t("menu.help.support"), onClick: () => funding.openPanel() },
       { separator: true, label: "" },
       { label: t("menu.help.checkUpdates"), onClick: () => void checkForUpdates(true) },
